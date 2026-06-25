@@ -3,8 +3,8 @@ from discord.ext import commands
 import os
 from datetime import datetime
 import asyncio
-import psycopg2
-from psycopg2.pool import SimpleConnectionPool
+import psycopg
+from psycopg_pool import ConnectionPool
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -26,7 +26,7 @@ def init_db_pool():
     """Initialize database connection pool"""
     global db_pool
     try:
-        db_pool = SimpleConnectionPool(1, 20, DATABASE_URL)
+        db_pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=20)
         print("✅ Database connection pool initialized")
     except Exception as e:
         print(f"❌ Database connection error: {e}")

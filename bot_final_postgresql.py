@@ -63,9 +63,15 @@ def create_tables():
                 name VARCHAR(100) NOT NULL,
                 weekly_points INTEGER DEFAULT 0,
                 total_points INTEGER DEFAULT 0,
+                last_snapshot_points INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+
+        # Migration safety net: add the column if the table already existed without it
+        cur.execute("""
+            ALTER TABLE staff ADD COLUMN IF NOT EXISTS last_snapshot_points INTEGER
         """)
 
         # Weekly reset log
@@ -495,7 +501,9 @@ async def set_points(ctx, member: discord.Member, points: int):
 @commands.has_permissions(administrator=True)
 async def bulk_set_weekly(ctx, *, raw_list: str = None):
     """
-    Paste a whole weekly list in one message and set weekly_points for everyone at once.
+    Paste a whole weekly list in one message. The bot compares each person's
+    "Points" value to their LAST saved snapshot and stores the DIFFERENCE as
+    weekly_points (i.e. how much they earned since the previous bulk update).
 
     Usage:
         !bulk_set_weekly
@@ -507,6 +515,7 @@ async def bulk_set_weekly(ctx, *, raw_list: str = None):
 
     Only the "Points:" value is used. "Available:" is ignored.
     Matches staff by their stored `name` (case-insensitive).
+    First-ever run for a person just sets the baseline (0 pts this week).
     """
     if not raw_list or not raw_list.strip():
         embed = discord.Embed(
@@ -539,27 +548,45 @@ async def bulk_set_weekly(ctx, *, raw_list: str = None):
         return
 
     updated = []
+    first_time = []
     not_found = []
 
     try:
         cur = conn.cursor()
-        cur.execute("SELECT staff_id, name FROM staff")
+        cur.execute("SELECT staff_id, name, last_snapshot_points FROM staff")
         db_staff = cur.fetchall()
-        # lowercase name -> staff_id
-        name_lookup = {name.strip().lower(): staff_id for staff_id, name in db_staff}
+        # lowercase name -> (staff_id, last_snapshot_points)
+        name_lookup = {n.strip().lower(): (sid, snap) for sid, n, snap in db_staff}
 
-        for name, points in entries:
+        for name, raw_points in entries:
             key = name.strip().lower()
-            staff_id = name_lookup.get(key)
-            if not staff_id:
-                not_found.append((name, points))
+            match = name_lookup.get(key)
+            if not match:
+                not_found.append((name, raw_points))
                 continue
 
-            cur.execute(
-                "UPDATE staff SET weekly_points = %s, updated_at = CURRENT_TIMESTAMP WHERE staff_id = %s",
-                (points, staff_id)
-            )
-            updated.append((name, points))
+            staff_id, last_snapshot = match
+
+            if last_snapshot is None:
+                # No baseline yet - can't compute a weekly delta, just store the
+                # snapshot so NEXT week's bulk update can calculate a real delta.
+                cur.execute(
+                    "UPDATE staff SET weekly_points = 0, last_snapshot_points = %s, updated_at = CURRENT_TIMESTAMP WHERE staff_id = %s",
+                    (raw_points, staff_id)
+                )
+                first_time.append((name, raw_points))
+            else:
+                weekly_delta = raw_points - last_snapshot
+                cur.execute(
+                    """UPDATE staff
+                       SET weekly_points = %s,
+                           total_points = total_points + %s,
+                           last_snapshot_points = %s,
+                           updated_at = CURRENT_TIMESTAMP
+                       WHERE staff_id = %s""",
+                    (weekly_delta, weekly_delta, raw_points, staff_id)
+                )
+                updated.append((name, weekly_delta, last_snapshot, raw_points))
 
         conn.commit()
     except Exception as e:
@@ -574,8 +601,8 @@ async def bulk_set_weekly(ctx, *, raw_list: str = None):
     finally:
         return_db_connection(conn)
 
-    desc = f"**Updated {len(updated)} staff member(s):**\n"
-    desc += "\n".join(f"• {n} → {p} pts" for n, p in updated) if updated else "_none_"
+    desc = f"**Updated {len(updated)} staff member(s) (this week's gain):**\n"
+    desc += "\n".join(f"• {n}: {old} → {new} = **{delta:+} pts** this week" for n, delta, old, new in updated) if updated else "_none_"
 
     embed = discord.Embed(
         title="✅ Bulk Weekly Set Complete",
@@ -583,6 +610,15 @@ async def bulk_set_weekly(ctx, *, raw_list: str = None):
         color=discord.Color.green()
     )
     await ctx.send(embed=embed)
+
+    if first_time:
+        ft_desc = "\n".join(f"• {n} (baseline set to {p} pts, 0 pts this week)" for n, p in first_time)
+        ft_embed = discord.Embed(
+            title="ℹ️ First Snapshot (no delta yet)",
+            description=f"These had no previous snapshot, so this week's gain can't be calculated yet. They'll show a proper weekly delta starting next week:\n\n{ft_desc}",
+            color=discord.Color.blue()
+        )
+        await ctx.send(embed=ft_embed)
 
     if not_found:
         nf_desc = "\n".join(f"• {n} ({p} pts)" for n, p in not_found)
